@@ -2,7 +2,7 @@ use actix_web::{get, post, web, App, HttpServer, Responder};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
-struct User {
+struct User { 
     id: u32, 
     name: String,
 }
