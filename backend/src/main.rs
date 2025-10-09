@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
 struct User {
-    id: u32,
+    id: u32, 
     name: String,
 }
 
