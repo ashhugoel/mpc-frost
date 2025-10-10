@@ -1,5 +1,6 @@
+mod utils; // if in src/utils.rs
 use actix_web::{App, HttpResponse, HttpServer, Responder, post, web};
-use base64::{Engine as _, engine::general_purpose::STANDARD};
+use base64::{engine::general_purpose::{self, STANDARD}, Engine as _};
 // use curve25519_dalek::ristretto::{RistrettoPoint, CompressedRistretto};
 use curve25519_dalek::{
     ristretto::{CompressedRistretto, RistrettoPoint},
@@ -7,12 +8,22 @@ use curve25519_dalek::{
 };
 use frost_dalek::{
     DistributedKeyGeneration, Parameters, Participant,
-    keygen::{Coefficients, RoundOne},
+    keygen::{Coefficients, DkgState, RoundOne},
     nizk::NizkOfSecretKey,
 };
 use reqwest;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
+
+use crate::utils::parse_peer_shares;
+
+#[derive(Deserialize)]
+struct RpcRequest {
+    jsonrpc: String,
+    method: String,
+    params: serde_json::Value,
+    id: u32,
+}
 
 #[derive(Clone)]
 struct AppState {
@@ -38,6 +49,11 @@ struct PeerCommitments {
     proof_s: String, // base64 of scalar bytes
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct PeerShare {
+    node_id: u32,
+    your_share: String, // base64 encoded
+}
 /// ---- Route: Initialize DKG ----
 #[post("/dkg/init")]
 async fn handle_dkg_init(data: web::Data<AppState>) -> impl Responder {
@@ -79,32 +95,20 @@ async fn handle_dkg_init(data: web::Data<AppState>) -> impl Responder {
     })
 }
 
-// 👇 expose your commitments
-#[post("/dkg/commitments")]
-async fn get_my_commitments(data: web::Data<AppState>) -> impl Responder {
-    let guard = data.participant.lock().unwrap();
-    let Some(p) = guard.as_ref() else {
-        return HttpResponse::BadRequest().body("init first");
-    };
-    // pseudocode: needs access to proof fields (see Options below)
-    let commits_b64: Vec<String> = p
-        .commitments
-        .iter()
-        .map(|pt| STANDARD.encode(pt.compress().to_bytes()))
-        .collect();
-
-    let (r_bytes, s_bytes) = p.proof_of_secret_key.to_bytess();
-
-    let proof_r_b64 = STANDARD.encode(r_bytes);
-    let proof_s_b64 = STANDARD.encode(s_bytes);
-
-    // build final JSON
-    HttpResponse::Ok().json(serde_json::json!({
-        "node_id": data.node_id,
-        "commitments": commits_b64,
-        "proof_r": proof_r_b64,
-        "proof_s": proof_s_b64
-    }))
+//RPC END POINT
+#[post("/rpc")]
+async fn rpc_handler(data: web::Data<AppState>, body: web::Json<RpcRequest>) -> impl Responder {
+    match body.method.as_str() {
+        "get_commitments" => match get_my_commitments(&data).await {
+            Ok(json) => HttpResponse::Ok().json(json),
+            Err(err) => err,
+        },
+        "get_my_share" => match get_my_share(&data, &body.params).await {
+            Ok(json) => HttpResponse::Ok().json(json),
+            Err(err) => err,
+        },
+        _ => HttpResponse::BadRequest().body("unknown method"),
+    }
 }
 
 // 👇 fetch commitments from peers
@@ -113,9 +117,17 @@ async fn fetch_peer_commitments(data: web::Data<AppState>) -> impl Responder {
     let client = reqwest::Client::new();
     let mut all: Vec<serde_json::Value> = vec![];
 
+    let rpc_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "get_commitments",
+        "params": {},
+        "id": 1
+    });
+
     for peer in &data.peer_urls {
-        let url = format!("{}/dkg/commitments", peer);
-        match client.post(&url).send().await {
+        println!("{}", peer);
+        let url = format!("{}/rpc", peer);
+        match client.post(&url).json(&rpc_body).send().await {
             Ok(resp) => {
                 if let Ok(json) = resp.json::<serde_json::Value>().await {
                     println!("📥 got commitments from {}", peer);
@@ -127,9 +139,15 @@ async fn fetch_peer_commitments(data: web::Data<AppState>) -> impl Responder {
     }
 
     // ---- decode them ----
-    let peers: Vec<PeerCommitments> =
-        serde_json::from_value(serde_json::Value::Array(all.clone())).unwrap();
-    println!("{:?}", peers);
+    let mut peers: Vec<PeerCommitments> = Vec::new();
+    for v in &all {
+        match serde_json::from_value::<PeerCommitments>(v.clone()) {
+            Ok(p) => peers.push(p),
+            Err(e) => eprintln!("⚠️ failed to parse peer commitment: {}", e),
+        }
+    }
+
+    // println!("{:?} here we have peers commitment", peers);
 
     let mut others = build_peer_participants(peers);
     let params = Parameters { t: 2, n: 3 };
@@ -151,9 +169,90 @@ async fn fetch_peer_commitments(data: web::Data<AppState>) -> impl Responder {
     let mut dkg_guard = data.dkg_state.lock().unwrap();
     *dkg_guard = Some(dkg.clone());
 
-    println!("✅ node {} DKG Round 1 prepared {:?}", data.node_id, dkg.their_secret_shares() );
+    println!("✅ node {} DKG Round 1 prepared", data.node_id,);
 
     HttpResponse::Ok().json(all)
+}
+
+#[post("/dkg/fetch_shares")]
+async fn fetch_peer_shares(data: web::Data<AppState>) -> impl Responder {
+    let client = reqwest::Client::new();
+    let mut all_shares: Vec<serde_json::Value> = vec![];
+
+    //  want the share for each peer
+    for peer in &data.peer_urls {
+        let rpc_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "get_my_share",
+            "params": { "node_id": data.node_id },
+            "id": 1 //not used at all
+        });
+
+        let url = format!("{}/rpc", peer);
+        match client.post(&url).json(&rpc_body).send().await {
+            Ok(resp) => {
+                if let Ok(json) = resp.json::<serde_json::Value>().await {
+                    println!("📥 got share from {}", peer);
+                    all_shares.push(json);
+                }
+            }
+            Err(e) => eprintln!("❌ failed to reach {}: {}", peer, e),
+        }
+    }
+
+    // Optionally: parse shares into a structured vector
+    let peers_shares: Vec<serde_json::Value> = all_shares.clone();
+    println!("Peers' shares: {:?}", peers_shares);
+
+    let othershares = parse_peer_shares(&all_shares);
+
+    
+    let p_guard = data.participant.lock().unwrap();
+    
+    let participant = match p_guard.as_ref() {
+        Some(p) => p,
+        None => return HttpResponse::BadRequest().body("Participant not initialized"),
+    };
+    let mut dkg_state_guard = data.dkg_state.lock().unwrap();
+
+    // Take ownership of the RoundOne state
+    let round_one_state = match dkg_state_guard.take() {
+        Some(s) => s,
+        None => return HttpResponse::BadRequest().body("DKG state not initialized"),
+    };
+    
+    
+    // Compute RoundTwo (consumes RoundOne)
+    let my_round2 = match round_one_state.to_round_two(othershares) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("⚠️ Failed to compute Round 2: {:?}", e);
+            return HttpResponse::InternalServerError().body("Failed round 2");
+        }
+    };
+    
+    // Optionally store the RoundTwo state back in the mutex if you need it later
+    // *dkg_state_guard = Some(my_round2.clone().into_round_one()); // optional
+    
+    // Finish DKG
+    let (group_key, _secret_key) = match my_round2.finish(participant.public_key().unwrap()) {
+        Ok(res) => res,
+        Err(e) => {
+            eprintln!("⚠️ Failed to Finish DKG : {:?}", e);
+            return HttpResponse::InternalServerError().body("❌ Failed to finish DKG");
+        }
+    };
+    
+    // ---- Encode for JSON ----
+    let compressed = group_key.to_bytes();
+    let group_b64 = general_purpose::STANDARD.encode(&compressed);
+
+    println!("✅ Group key (base64): {}", group_b64);
+    
+    HttpResponse::Ok().json(serde_json::json!({
+        "group_key": group_b64,
+    }))
+    
 }
 
 #[tokio::main]
@@ -203,8 +302,9 @@ async fn main() -> std::io::Result<()> {
             App::new()
                 .app_data(state.clone())
                 .service(handle_dkg_init)
-                .service(get_my_commitments) // 👈 add
+                .service(rpc_handler) // 👈 add
                 .service(fetch_peer_commitments)
+                .service(fetch_peer_shares)
         } // 👈 add
     })
     .bind(&listen)?
@@ -251,4 +351,62 @@ fn build_peer_participants(peers: Vec<PeerCommitments>) -> Vec<Participant> {
     }
 
     others
+}
+
+//RPC METHODS ------------------------------------------------------------------------------------------------
+async fn get_my_commitments(data: &web::Data<AppState>) -> Result<serde_json::Value, HttpResponse> {
+    let guard = data.participant.lock().unwrap();
+    let Some(p) = guard.as_ref() else {
+        return Err(HttpResponse::BadRequest().body("init first"));
+    };
+
+    let commits_b64: Vec<String> = p
+        .commitments
+        .iter()
+        .map(|pt| STANDARD.encode(pt.compress().to_bytes()))
+        .collect();
+
+    // Convert the proof scalars to bytes
+    let (r_bytes, s_bytes) = p.proof_of_secret_key.to_bytess();
+    let proof_r_b64 = STANDARD.encode(r_bytes);
+    let proof_s_b64 = STANDARD.encode(s_bytes);
+
+    Ok(serde_json::json!({
+        "node_id": data.node_id,
+        "commitments": commits_b64,
+        "proof_r": proof_r_b64,
+        "proof_s": proof_s_b64
+    }))
+}
+
+async fn get_my_share(
+    data: &web::Data<AppState>,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, HttpResponse> {
+    let node_id = match params.get("node_id").and_then(|v| v.as_u64()) {
+        Some(id) => id as usize,
+        None => return Err(HttpResponse::BadRequest().body("missing or invalid node_id")),
+    };
+
+    let dkg_state = data.dkg_state.lock().unwrap();
+    let state = dkg_state.as_ref().ok_or_else(|| {
+        HttpResponse::BadRequest().body("DKG state not initialized you need dkg/inti and dkg/fetch")
+    })?;
+
+    let shares = state.their_secret_shares().expect("Current node shares");
+    
+    println!("shares to be passed {:?}" , shares);
+
+    let other_share = shares
+        .iter()
+        .find(|s| s.index as usize == node_id)
+        .ok_or_else(|| HttpResponse::BadRequest().body("node_id not found"))?
+        .clone();
+
+    let share_bytes = STANDARD.encode(other_share.to_bytes());
+
+    Ok(serde_json::json!({
+        "node_id": data.node_id,
+        "your_share": share_bytes,
+    }))
 }
