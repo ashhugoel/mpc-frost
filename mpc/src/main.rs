@@ -11,7 +11,7 @@ use curve25519_dalek::{
 };
 use frost_dalek::{
     DistributedKeyGeneration, Parameters, Participant,
-    keygen::{Coefficients, RoundOne},
+    keygen::{Coefficients, DkgState, RoundOne},
     nizk::NizkOfSecretKey,
 };
 use reqwest;
@@ -368,7 +368,7 @@ fn build_peer_participants(peers: Vec<PeerCommitments>) -> Vec<Participant> {
         
         println!("[node {}] 🔍 Decoded commitments:", peer.node_id);
         println!(" Decoded commitments: {:?}", decoded_points);
-
+        
         for (i, point) in decoded_points.iter().enumerate() {
             let compressed_bytes = point.compress().to_bytes();
             println!(
