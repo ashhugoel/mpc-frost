@@ -19,6 +19,10 @@ pub fn parse_peer_shares(json_shares: &[Value]) -> Vec<SecretShare> {
                     );
                     // Use the constructor instead of direct field access
                     let share = SecretShare::from_scalar(node_id as u32, scalar);
+
+                            // ✅ Print the share bytes for debugging
+        println!("🟣 Decoded share for node {}: {:?}", node_id, share.to_bytes());
+
                     shares_vec.push(share);
                 }
                 Err(e) => eprintln!("⚠️ Failed to decode share for node {}: {}", node_id, e),

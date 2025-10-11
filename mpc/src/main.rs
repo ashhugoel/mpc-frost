@@ -1,6 +1,9 @@
 mod utils; // if in src/utils.rs
 use actix_web::{App, HttpResponse, HttpServer, Responder, post, web};
-use base64::{engine::general_purpose::{self, STANDARD}, Engine as _};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{self, STANDARD},
+};
 // use curve25519_dalek::ristretto::{RistrettoPoint, CompressedRistretto};
 use curve25519_dalek::{
     ristretto::{CompressedRistretto, RistrettoPoint},
@@ -8,7 +11,7 @@ use curve25519_dalek::{
 };
 use frost_dalek::{
     DistributedKeyGeneration, Parameters, Participant,
-    keygen::{Coefficients, DkgState, RoundOne},
+    keygen::{Coefficients, RoundOne},
     nizk::NizkOfSecretKey,
 };
 use reqwest;
@@ -23,6 +26,14 @@ struct RpcRequest {
     method: String,
     params: serde_json::Value,
     id: u32,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CommitmentsPayload {
+    node_id: u32,
+    commitments: Vec<[u8; 32]>, // the compressed Ristretto bytes
+    proof_r: [u8; 32],
+    proof_s: [u8; 32],
 }
 
 #[derive(Clone)]
@@ -41,12 +52,12 @@ struct InitResponse {
     message: String,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Serialize, Deserialize)]
 struct PeerCommitments {
     node_id: u32,
-    commitments: Vec<String>,
-    proof_r: String, // base64 of scalar bytes
-    proof_s: String, // base64 of scalar bytes
+    commitments: Vec<[u8; 32]>, // the compressed Ristretto bytes
+    proof_r: [u8; 32],
+    proof_s: [u8; 32],
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -74,11 +85,24 @@ async fn handle_dkg_init(data: web::Data<AppState>) -> impl Responder {
     // Step 2: Create participant and coefficients
     let (participant, coeffs) = Participant::new(&params, data.node_id);
 
+    //debugimg
+    let compressed_commitments: Vec<[u8; 32]> = participant
+        .commitments
+        .iter()
+        .map(|p| p.compress().to_bytes())
+        .collect();
+    
     println!(
-        "[node {}] ✅ DKG initialized | commitments: {:?}",
-        data.node_id, participant.commitments
+        "[commitment for node  : {:?}",participant
     );
 
+
+    println!(
+        "[node {}] commitments ({} points): {:?}",
+        data.node_id,
+        compressed_commitments.len(),
+        compressed_commitments
+    );
     // Step 3: Store participant in state
 
     let commitments_count = participant.commitments.len();
@@ -100,7 +124,7 @@ async fn handle_dkg_init(data: web::Data<AppState>) -> impl Responder {
 async fn rpc_handler(data: web::Data<AppState>, body: web::Json<RpcRequest>) -> impl Responder {
     match body.method.as_str() {
         "get_commitments" => match get_my_commitments(&data).await {
-            Ok(json) => HttpResponse::Ok().json(json),
+            Ok(resp) => resp, // <-- don't wrap it in .json()
             Err(err) => err,
         },
         "get_my_share" => match get_my_share(&data, &body.params).await {
@@ -115,7 +139,7 @@ async fn rpc_handler(data: web::Data<AppState>, body: web::Json<RpcRequest>) -> 
 #[post("/dkg/fetch")]
 async fn fetch_peer_commitments(data: web::Data<AppState>) -> impl Responder {
     let client = reqwest::Client::new();
-    let mut all: Vec<serde_json::Value> = vec![];
+    let mut all: Vec<Vec<u8>> = vec![];
 
     let rpc_body = serde_json::json!({
         "jsonrpc": "2.0",
@@ -129,21 +153,30 @@ async fn fetch_peer_commitments(data: web::Data<AppState>) -> impl Responder {
         let url = format!("{}/rpc", peer);
         match client.post(&url).json(&rpc_body).send().await {
             Ok(resp) => {
-                if let Ok(json) = resp.json::<serde_json::Value>().await {
-                    println!("📥 got commitments from {}", peer);
-                    all.push(json);
+                match resp.bytes().await {
+                    Ok(bytes) => {
+                        println!("📥 got commitments from {}", peer);
+                        all.push(bytes.to_vec()); // store raw bincode bytes
+                    }
+                    Err(e) => eprintln!("⚠️ failed to read bytes from {}: {}", peer, e),
                 }
             }
             Err(e) => eprintln!("❌ failed to reach {}: {}", peer, e),
         }
     }
 
-    // ---- decode them ----
+    // ---- decode raw bincode payloads ----
     let mut peers: Vec<PeerCommitments> = Vec::new();
-    for v in &all {
-        match serde_json::from_value::<PeerCommitments>(v.clone()) {
-            Ok(p) => peers.push(p),
-            Err(e) => eprintln!("⚠️ failed to parse peer commitment: {}", e),
+    for bytes in &all {
+        match bincode::serde::decode_from_slice::<PeerCommitments, _>(
+            bytes,
+            bincode::config::standard(),
+        ) {
+            Ok((payload, _len)) => {
+                // convert CommitmentsPayload into PeerCommitments if needed
+                peers.push(payload);
+            }
+            Err(e) => eprintln!("⚠️ failed to decode peer commitment: {}", e),
         }
     }
 
@@ -200,15 +233,12 @@ async fn fetch_peer_shares(data: web::Data<AppState>) -> impl Responder {
         }
     }
 
-    // Optionally: parse shares into a structured vector
-    let peers_shares: Vec<serde_json::Value> = all_shares.clone();
-    println!("Peers' shares: {:?}", peers_shares);
+
 
     let othershares = parse_peer_shares(&all_shares);
 
-    
     let p_guard = data.participant.lock().unwrap();
-    
+
     let participant = match p_guard.as_ref() {
         Some(p) => p,
         None => return HttpResponse::BadRequest().body("Participant not initialized"),
@@ -220,8 +250,7 @@ async fn fetch_peer_shares(data: web::Data<AppState>) -> impl Responder {
         Some(s) => s,
         None => return HttpResponse::BadRequest().body("DKG state not initialized"),
     };
-    
-    
+
     // Compute RoundTwo (consumes RoundOne)
     let my_round2 = match round_one_state.to_round_two(othershares) {
         Ok(r) => r,
@@ -230,10 +259,10 @@ async fn fetch_peer_shares(data: web::Data<AppState>) -> impl Responder {
             return HttpResponse::InternalServerError().body("Failed round 2");
         }
     };
-    
+
     // Optionally store the RoundTwo state back in the mutex if you need it later
     // *dkg_state_guard = Some(my_round2.clone().into_round_one()); // optional
-    
+
     // Finish DKG
     let (group_key, _secret_key) = match my_round2.finish(participant.public_key().unwrap()) {
         Ok(res) => res,
@@ -242,17 +271,16 @@ async fn fetch_peer_shares(data: web::Data<AppState>) -> impl Responder {
             return HttpResponse::InternalServerError().body("❌ Failed to finish DKG");
         }
     };
-    
+
     // ---- Encode for JSON ----
     let compressed = group_key.to_bytes();
     let group_b64 = general_purpose::STANDARD.encode(&compressed);
 
     println!("✅ Group key (base64): {}", group_b64);
-    
+
     HttpResponse::Ok().json(serde_json::json!({
         "group_key": group_b64,
     }))
-    
 }
 
 #[tokio::main]
@@ -321,31 +349,34 @@ fn build_peer_participants(peers: Vec<PeerCommitments>) -> Vec<Participant> {
             .commitments
             .iter()
             .map(|s| {
-                let bytes = STANDARD.decode(s).expect("valid base64");
-                let compressed = CompressedRistretto::from_slice(&bytes);
+                let compressed = CompressedRistretto::from_slice(s);
                 compressed.decompress().expect("valid point")
             })
             .collect();
 
         // ---- decode proof fields (r, s) ----
-        let r_bytes = STANDARD
-            .decode(&peer.proof_r)
-            .expect("valid base64 for proof_r");
-        let s_bytes = STANDARD
-            .decode(&peer.proof_s)
-            .expect("valid base64 for proof_s");
-
-        let r = Scalar::from_bytes_mod_order(r_bytes.try_into().expect("32 bytes for r"));
-        let s = Scalar::from_bytes_mod_order(s_bytes.try_into().expect("32 bytes for s"));
-
+        let r = Scalar::from_bytes_mod_order(peer.proof_r);
+        let s = Scalar::from_bytes_mod_order(peer.proof_s);
         let proof = NizkOfSecretKey::from_scalars(r, s);
 
         // ---- construct full Participant ----
         let p = Participant {
             index: peer.node_id,
-            commitments: decoded_points,
+            commitments: decoded_points.clone(),
             proof_of_secret_key: proof,
         };
+        
+        println!("[node {}] 🔍 Decoded commitments:", peer.node_id);
+        println!(" Decoded commitments: {:?}", decoded_points);
+
+        for (i, point) in decoded_points.iter().enumerate() {
+            let compressed_bytes = point.compress().to_bytes();
+            println!(
+                "   commitment[{}] compressed bytes: {:?}",
+                i, compressed_bytes
+            );
+        }
+        
 
         others.push(p);
     }
@@ -353,30 +384,67 @@ fn build_peer_participants(peers: Vec<PeerCommitments>) -> Vec<Participant> {
     others
 }
 
+// Helper to print points deterministically
+fn print_points(name: &str, points: &[RistrettoPoint]) {
+    println!("{}:", name);
+    for (i, pt) in points.iter().enumerate() {
+        let bytes = pt.compress().to_bytes();
+        println!("Point {}: {:?}", i, bytes);
+    }
+}
+
 //RPC METHODS ------------------------------------------------------------------------------------------------
-async fn get_my_commitments(data: &web::Data<AppState>) -> Result<serde_json::Value, HttpResponse> {
+async fn get_my_commitments(data: &web::Data<AppState>) -> Result<HttpResponse, HttpResponse> {
     let guard = data.participant.lock().unwrap();
     let Some(p) = guard.as_ref() else {
         return Err(HttpResponse::BadRequest().body("init first"));
     };
 
-    let commits_b64: Vec<String> = p
+    // ✅ deterministic print before encoding
+    print_points("Before encoding", &p.commitments);
+
+    // Serialize commitments as bytes
+    let commitments: Vec<[u8; 32]> = p
         .commitments
         .iter()
-        .map(|pt| STANDARD.encode(pt.compress().to_bytes()))
+        .map(|pt| pt.compress().to_bytes())
+        .collect();
+    let (r_bytes, s_bytes) = p.proof_of_secret_key.to_bytess();
+
+    let payload = PeerCommitments {
+        node_id: data.node_id,
+        commitments: commitments.clone(),
+        proof_r: r_bytes,
+        proof_s: s_bytes,
+    };
+
+    // Encode
+    let encoded = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
+        .map_err(|e| HttpResponse::InternalServerError().body(e.to_string()))?;
+
+    // Decode immediately
+    let decoded: PeerCommitments =
+        bincode::serde::decode_from_slice(&encoded, bincode::config::standard())
+            .map_err(|e| HttpResponse::InternalServerError().body(e.to_string()))?
+            .0;
+
+    // Rebuild points for round-trip check
+    let decoded_points: Vec<RistrettoPoint> = decoded
+        .commitments
+        .iter()
+        .map(|b| {
+            CompressedRistretto::from_slice(b)
+                .decompress()
+                .expect("invalid point")
+        })
         .collect();
 
-    // Convert the proof scalars to bytes
-    let (r_bytes, s_bytes) = p.proof_of_secret_key.to_bytess();
-    let proof_r_b64 = STANDARD.encode(r_bytes);
-    let proof_s_b64 = STANDARD.encode(s_bytes);
+    // ✅ deterministic print after decoding
+    print_points("After decoding", &decoded_points);
 
-    Ok(serde_json::json!({
-        "node_id": data.node_id,
-        "commitments": commits_b64,
-        "proof_r": proof_r_b64,
-        "proof_s": proof_s_b64
-    }))
+    Ok(HttpResponse::Ok()
+        .content_type("application/octet-stream")
+        .body(encoded))
 }
 
 async fn get_my_share(
@@ -394,8 +462,14 @@ async fn get_my_share(
     })?;
 
     let shares = state.their_secret_shares().expect("Current node shares");
-    
-    println!("shares to be passed {:?}" , shares);
+
+    for share in shares.iter() {
+        println!(
+            "🟢 share index: {}, bytes: {:?}",
+            share.index,
+            share.to_bytes()
+        );
+    }
 
     let other_share = shares
         .iter()
