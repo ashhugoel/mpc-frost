@@ -1,104 +1,135 @@
-use frost_dalek::{DistributedKeyGeneration, Participant, Parameters};
-// add this:
-use curve25519_dalek::ristretto::CompressedRistretto;
-use base64::{engine::general_purpose, Engine as _};
+use base64::{Engine as _, engine::general_purpose};
+use bincode::{config, encode_to_vec};
+use ed25519_dalek::VerifyingKey as DalekPubkey;
+use frost::keys::dkg;
+use frost_ed25519::{self as frost, Ed25519Sha512, Identifier};
+use rand::rngs::OsRng;
+use solana_sdk::pubkey::Pubkey;
+use std::collections::BTreeMap;
 
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let threshold = 2;
+    let mut rng = OsRng;
 
-
-
-fn main() { 
-    // ---- 1. basic parameters ----
-    let params = Parameters { t: 2, n: 3 };
-
-    // ---- 2. each participant creates initial material ----
-    let (alice, alice_coeffs) = Participant::new(&params, 1);
-    let (bob, bob_coeffs) = Participant::new(&params, 2);
-    let (carol, carol_coeffs) = Participant::new(&params, 3);
-
-    // ---- 3. round 1 ----
-    let mut others_for_alice = vec![bob.clone(), carol.clone()];
-    let mut alice_state =
-        DistributedKeyGeneration::<_>::new(&params, &alice.index, &alice_coeffs, &mut others_for_alice)
-            .expect("Alice DKG round 1");
-
-    let alice_shares = alice_state.their_secret_shares().expect("Alice shares");
-
-    let mut others_for_bob = vec![alice.clone(), carol.clone()];
-    let mut bob_state =
-        DistributedKeyGeneration::<_>::new(&params, &bob.index, &bob_coeffs, &mut others_for_bob)
-            .expect("Bob DKG round 1");
-
-    let bob_shares = bob_state.their_secret_shares().expect("Bob shares");
-
-    let mut others_for_carol = vec![alice.clone(), bob.clone()];
-    let mut carol_state =
-        DistributedKeyGeneration::<_>::new(&params, &carol.index, &carol_coeffs, &mut others_for_carol)
-            .expect("Carol DKG round 1");
-
-    let carol_shares = carol_state.their_secret_shares().expect("Carol shares");
-
-    // ---- 4. deliver shares to each participant ----
-    let alice_received = vec![bob_shares[0].clone(), carol_shares[0].clone()];
-    let bob_received   = vec![alice_shares[0].clone(), carol_shares[1].clone()];
-    let carol_received = vec![alice_shares[1].clone(), bob_shares[1].clone()];
-
-    // ---- 5. round 2 ----
-    let alice_round2 = alice_state.to_round_two(alice_received).expect("Alice round 2");
-    let bob_round2   = bob_state.to_round_two(bob_received).expect("Bob round 2");
-    let carol_round2 = carol_state.to_round_two(carol_received).expect("Carol round 2");
-
-    // ---- 6. finish → each gets (group key, secret share) ----
-    let (alice_group, alice_secret) = alice_round2.finish(alice.public_key().unwrap()).unwrap();
-    let (bob_group, bob_secret)     = bob_round2.finish(bob.public_key().unwrap()).unwrap();
-    let (carol_group, carol_secret) = carol_round2.finish(carol.public_key().unwrap()).unwrap();
-
-    // ---- 7. verify same group key ----
-// ---- 7. verify same group key ----
-    assert_eq!(alice_group, bob_group);
-    assert_eq!(bob_group, carol_group);
-
-    let group_pub_compressed: CompressedRistretto = alice.public_key().unwrap().compress();
-
-
-    let compressed = alice_group.to_bytes(); // frost-dalek implements this for GroupKey
-    let group_b64 = general_purpose::STANDARD.encode(&compressed);
-    
-    println!("✅ Shared group public key (Base64): {}", group_b64);
-
-
-    let compressed = bob_group.to_bytes(); // frost-dalek implements this for GroupKey
-    let group_b64 = general_purpose::STANDARD.encode(&compressed);
-    
-    println!("✅ Shared group public key (Base64): {}", group_b64);
+    let alice_id = Identifier::try_from(1u16)?;
+    let bob_id = Identifier::try_from(2u16)?;
+    let carol_id = Identifier::try_from(3u16)?;
 
     
-    
-    println!("---------------------------------------------------------------------------------------------------------");
-    let alice_b64 = participant_pubkey_base64(&alice);
-    let bob_b64   = participant_pubkey_base64(&bob);
-    let carol_b64 = participant_pubkey_base64(&carol);
-    
-    println!("Alice public key (Base64): {}", alice_b64);
-    println!("Bob public key (Base64):   {}", bob_b64);
-    println!("Carol public key (Base64): {}", carol_b64);
+// Print them out
+println!("Alice ID: {:?}", alice_id);
+println!("Bob ID: {:?}", bob_id);
+println!("Carol ID: {:?}", carol_id);
 
-    // println!("✅ DKG complete — all participants derived the same group key!");
-    // println!("Alice secret share: {:?}", alice_secret);
-    // println!("Bob secret share: {:?}", bob_secret);
-    // println!("Carol secret share: {:?}", carol_secret);
+    // ---- Round 1: Generate commitments for each participant ----
+    let (alice_secret, alice_package) = dkg::part1(alice_id, 3, threshold, &mut rng)?;
+    let (bob_secret, bob_package) = dkg::part1(bob_id, 3, threshold, &mut rng)?;
+    let (carol_secret, carol_package) = dkg::part1(carol_id, 3, threshold, &mut rng)?;
 
-}
+    // ---- Prepare peer maps for Round 2 ----2
+    // Each participant excludes their own Round 1 package
+    let mut alice_peers = BTreeMap::new();
+    alice_peers.insert(bob_id, bob_package.clone());
+    alice_peers.insert(carol_id, carol_package.clone());
+
+    let mut bob_peers = BTreeMap::new();
+    bob_peers.insert(alice_id, alice_package.clone());
+    bob_peers.insert(carol_id, carol_package.clone());
+
+    let mut carol_peers = BTreeMap::new();
+    carol_peers.insert(alice_id, alice_package.clone());
+    carol_peers.insert(bob_id, bob_package.clone());
+
+    println!("✅ Round 1 done");
+
+    // ---- Round 2 ----
+    let (alice_r2_secret, alice_r2_pkgs) = dkg::part2(alice_secret, &alice_peers)?;
+    let (bob_r2_secret, bob_r2_pkgs) = dkg::part2(bob_secret, &bob_peers)?;
+    let (carol_r2_secret, carol_r2_pkgs) = dkg::part2(carol_secret, &carol_peers)?;
+
+    // Serialize
+    let bytes = alice_r2_pkgs[&bob_id].serialize()?;
 
 
-pub fn participant_pubkey_base64(participant: &Participant) -> String {
-    // 1️⃣ Extract public key (RistrettoPoint)
-    let pk_point = participant
-        .public_key()
-        .expect("Participant must have a valid public key");
+    println!("✅ Round 2 done  {:?}" , bytes);
 
-    // 2️⃣ Compress the point into 32 bytes
-    let compressed: CompressedRistretto = pk_point.compress();
+    let pkg_back = dkg::round2::Package::deserialize(&bytes)?;
 
-    // 3️⃣ Convert to bytes and encode as Base64 string
-    general_purpose::STANDARD.encode(compressed.as_bytes())
+    println!("✅ pk before encoding{:?}" ,  alice_r2_pkgs[&bob_id].signing_share.to_scalar());
+
+
+    println!("✅ pk after deconding{:?}" , pkg_back.signing_share.to_scalar());
+
+
+
+    // ---- Build correct Round 2 package maps ----
+    // Alice receives from Bob + Carol (NO self)
+    let mut alice_r2_incoming = BTreeMap::new();
+    alice_r2_incoming.insert(bob_id, bob_r2_pkgs[&alice_id].clone());
+    alice_r2_incoming.insert(carol_id, carol_r2_pkgs[&alice_id].clone());
+
+    // Bob receives from Alice + Carol (NO self)
+    let mut bob_r2_incoming = BTreeMap::new();
+    bob_r2_incoming.insert(alice_id, alice_r2_pkgs[&bob_id].clone());
+    bob_r2_incoming.insert(carol_id, carol_r2_pkgs[&bob_id].clone());
+
+    // Carol receives from Alice + Bob (NO self)
+    let mut carol_r2_incoming = BTreeMap::new();
+    carol_r2_incoming.insert(alice_id, alice_r2_pkgs[&carol_id].clone());
+    carol_r2_incoming.insert(bob_id, bob_r2_pkgs[&carol_id].clone());
+
+    // ---- Each participant now calls part3 ----
+
+
+    // ---- Each participant's Round1 peer view ----
+    let mut alice_round1_peers = BTreeMap::new();
+    alice_round1_peers.insert(bob_id, bob_package.clone());
+    alice_round1_peers.insert(carol_id, carol_package.clone());
+
+    let mut bob_round1_peers = BTreeMap::new();
+    bob_round1_peers.insert(alice_id, alice_package.clone());
+    bob_round1_peers.insert(carol_id, carol_package.clone());
+
+    let mut carol_round1_peers = BTreeMap::new();
+    carol_round1_peers.insert(alice_id, alice_package.clone());
+    carol_round1_peers.insert(bob_id, bob_package.clone());
+
+    let (alice_key, alice_pub) =
+        dkg::part3(&alice_r2_secret, &alice_round1_peers, &alice_r2_incoming)?;
+    let (bob_key, bob_pub) = dkg::part3(&bob_r2_secret, &bob_round1_peers, &bob_r2_incoming)?;
+    let (carol_key, carol_pub) =
+        dkg::part3(&carol_r2_secret, &carol_round1_peers, &carol_r2_incoming)?;
+
+    println!("✅ Round 3 done");
+    println!("Alice pub: {:?}", alice_pub);
+    println!("Bob   pub: {:?}", bob_pub);
+    println!("Carol pub: {:?}", carol_pub);
+
+    // ---- Verify that group keys match ----
+    assert_eq!(alice_pub, bob_pub);
+    assert_eq!(bob_pub, carol_pub);
+
+    let vk_bytes = alice_pub.verifying_key().serialize()?;
+    let vk_arr: [u8; 32] = vk_bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("wrong key length"))?;
+    let dalek = DalekPubkey::from_bytes(&vk_arr)?;
+    let sol_pk = Pubkey::new_from_array(dalek.to_bytes());
+    println!("Solana address: {}", sol_pk);
+
+
+    let vk_bytes = bob_pub.verifying_key().serialize()?;
+    let vk_arr: [u8; 32] = vk_bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("wrong key length"))?;
+    let dalek = DalekPubkey::from_bytes(&vk_arr)?;
+    let sol_pk = Pubkey::new_from_array(dalek.to_bytes());
+    println!("Solana address: {}", sol_pk);
+
+
+    println!("{:?}", alice_key);
+
+
+
+    Ok(())
 }

@@ -4,6 +4,7 @@ use base64::{
     Engine as _,
     engine::general_purpose::{self, STANDARD},
 };
+use ed25519_dalek::VerifyingKey as DalekPubkey;
 // use curve25519_dalek::ristretto::{RistrettoPoint, CompressedRistretto};
 use curve25519_dalek::{
     ristretto::{CompressedRistretto, RistrettoPoint},
@@ -14,9 +15,18 @@ use frost_dalek::{
     keygen::{Coefficients, DkgState, RoundOne},
     nizk::NizkOfSecretKey,
 };
+use frost_ed25519::{
+    Identifier,
+    keys::{KeyPackage, PublicKeyPackage, dkg},
+};
+use rand_core::OsRng;
 use reqwest;
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
+use solana_sdk::pubkey::Pubkey;
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
 
 use crate::utils::parse_peer_shares;
 
@@ -30,19 +40,31 @@ struct RpcRequest {
 
 #[derive(Serialize, Deserialize)]
 struct CommitmentsPayload {
-    node_id: u32,
-    commitments: Vec<[u8; 32]>, // the compressed Ristretto bytes
-    proof_r: [u8; 32],
-    proof_s: [u8; 32],
+    node_id: Vec<u8>,
+    package: Vec<u8>, // serialized bytes of the Round1 package
 }
 
 #[derive(Clone)]
 struct AppState {
-    node_id: u32,
-    participant: Arc<Mutex<Option<Participant>>>,
-    peer_urls: Vec<String>,
-    coeffs: Arc<Mutex<Option<Coefficients>>>,
-    dkg_state: Arc<Mutex<Option<DistributedKeyGeneration<RoundOne>>>>,
+    // Node identity / network
+    pub node_id: Identifier, // this node’s Identifier (e.g., Identifier::try_from(1u16)?)
+    pub n: u16,              // total participants
+    pub t: u16,              // threshold
+    pub peer_urls: Vec<String>, // HTTP endpoints for other nodes
+
+    // ---- Round 1 state ----
+    pub r1_secret: Arc<Mutex<Option<dkg::round1::SecretPackage>>>, // my Round1 secret (kept local)
+    pub r1_package: Arc<Mutex<Option<dkg::round1::Package>>>,      // my Round1 package to broadcast
+    pub r1_received: Arc<Mutex<BTreeMap<Identifier, dkg::round1::Package>>>, // peers’ Round1 packages
+
+    // ---- Round 2 state ----
+    pub r2_secret: Arc<Mutex<Option<dkg::round2::SecretPackage>>>, // my Round2 secret (kept local)
+    pub r2_outgoing: Arc<Mutex<Option<BTreeMap<Identifier, dkg::round2::Package>>>>, // pkgs I produced (addressed to peers)
+    pub r2_incoming: Arc<Mutex<BTreeMap<Identifier, dkg::round2::Package>>>, // pkgs I received (addressed to me)
+
+    // ---- Final (after part3) ----
+    pub key_package: Arc<Mutex<Option<KeyPackage>>>, // my private signing share package
+    pub pubkey_package: Arc<Mutex<Option<PublicKeyPackage>>>, // shared group public key package
 }
 
 #[derive(Serialize, Deserialize)]
@@ -67,68 +89,59 @@ struct PeerShare {
 }
 /// ---- Route: Initialize DKG ----
 #[post("/dkg/init")]
-async fn handle_dkg_init(data: web::Data<AppState>) -> impl Responder {
-    let mut p_guard = data.participant.lock().unwrap();
-
-    // Prevent double initialization
-    if p_guard.is_some() {
-        return HttpResponse::Ok().json(InitResponse {
-            node_id: data.node_id,
-            commitments_count: 0,
-            message: "Already initialized".into(),
-        });
+pub async fn handle_dkg_init(data: web::Data<AppState>) -> impl Responder {
+    // Acquire lock for Round 1 secret state
+    let mut r1_secret_guard = data.r1_secret.lock().unwrap();
+    // Prevent re-initialization
+    if r1_secret_guard.is_some() {
+        return HttpResponse::Ok().json(serde_json::json!({
+            "node_id": format!("{:?}", data.node_id),
+            "message": "Already initialized",
+        }));
     }
+    // ---- Step 1: parameters ----
+    let threshold = data.t;
+    let total = data.n;
+    let mut rng = OsRng;
 
-    // Step 1: Setup parameters (t = 2, n = 3 for demo)
-    let params = Parameters { t: 2, n: 3 };
+    // ---- Step 2: run part1 for this node ----
+    let (secret_pkg, pkg) = match dkg::part1(data.node_id, total, threshold, &mut rng) {
+        Ok(v) => v,
+        Err(e) => {
+            return HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": format!("Failed in dkg::part1: {:?}", e)
+            }));
+        }
+    };
 
-    // Step 2: Create participant and coefficients
-    let (participant, coeffs) = Participant::new(&params, data.node_id);
+    // ---- Step 3: store locally ----
+    *r1_secret_guard = Some(secret_pkg);
+    let mut r1_pkg_guard = data.r1_package.lock().unwrap();
+    *r1_pkg_guard = Some(pkg.clone());
 
-    //debugimg
-    let compressed_commitments: Vec<[u8; 32]> = participant
-        .commitments
-        .iter()
-        .map(|p| p.compress().to_bytes())
-        .collect();
-    
+    // (optional) debug log
     println!(
-        "[commitment for node  : {:?}",participant
-    );
-
-
-    println!(
-        "[node {}] commitments ({} points): {:?}",
+        "✅ [Node {:?}] DKG init complete: generated Round1 commitments",
         data.node_id,
-        compressed_commitments.len(),
-        compressed_commitments
     );
-    // Step 3: Store participant in state
 
-    let commitments_count = participant.commitments.len();
-    *p_guard = Some(participant);
-
-    let mut coeff_guard = data.coeffs.lock().unwrap();
-    *coeff_guard = Some(coeffs);
-
-    // Step 4: Respond with summary
-    HttpResponse::Ok().json(InitResponse {
-        node_id: data.node_id,
-        commitments_count: commitments_count,
-        message: "DKG material initialized successfully".into(),
-    })
+    // ---- Step 4: respond ----
+    HttpResponse::Ok().json(serde_json::json!({
+        "node_id": format!("{:?}", data.node_id),
+        "message": "DKG Round1 initialized successfully"
+    }))
 }
 
 //RPC END POINT
 #[post("/rpc")]
 async fn rpc_handler(data: web::Data<AppState>, body: web::Json<RpcRequest>) -> impl Responder {
     match body.method.as_str() {
-        "get_commitments" => match get_my_commitments(&data).await {
+        "get_commitments" => match get_my_commitments(data).await {
             Ok(resp) => resp, // <-- don't wrap it in .json()
             Err(err) => err,
         },
         "get_my_share" => match get_my_share(&data, &body.params).await {
-            Ok(json) => HttpResponse::Ok().json(json),
+            Ok(resp) => resp, // <-- don't wrap it in .json()
             Err(err) => err,
         },
         _ => HttpResponse::BadRequest().body("unknown method"),
@@ -137,149 +150,203 @@ async fn rpc_handler(data: web::Data<AppState>, body: web::Json<RpcRequest>) -> 
 
 // 👇 fetch commitments from peers
 #[post("/dkg/fetch")]
-async fn fetch_peer_commitments(data: web::Data<AppState>) -> impl Responder {
+pub async fn fetch_peer_commitments(data: web::Data<AppState>) -> impl Responder {
     let client = reqwest::Client::new();
-    let mut all: Vec<Vec<u8>> = vec![];
-
-    let rpc_body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "method": "get_commitments",
-        "params": {},
-        "id": 1
-    });
-
+    let mut all_bytes: Vec<Vec<u8>> = vec![];
+    // ---- Step 1: fetch Round1 packages from all peers ----
     for peer in &data.peer_urls {
-        println!("{}", peer);
-        let url = format!("{}/rpc", peer);
+        let url = format!("{}/rpc", peer); // ✅ use the RPC route
+
+        let rpc_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "get_commitments",
+            "params": {},
+            "id": 1
+        });
+
         match client.post(&url).json(&rpc_body).send().await {
-            Ok(resp) => {
-                match resp.bytes().await {
-                    Ok(bytes) => {
-                        println!("📥 got commitments from {}", peer);
-                        all.push(bytes.to_vec()); // store raw bincode bytes
-                    }
-                    Err(e) => eprintln!("⚠️ failed to read bytes from {}: {}", peer, e),
+            Ok(resp) => match resp.bytes().await {
+                Ok(bytes) => {
+                    println!("📥 got commitments from {}", peer);
+                    all_bytes.push(bytes.to_vec());
                 }
-            }
+                Err(e) => eprintln!("⚠️ failed to read bytes from {}: {}", peer, e),
+            },
             Err(e) => eprintln!("❌ failed to reach {}: {}", peer, e),
         }
     }
 
-    // ---- decode raw bincode payloads ----
-    let mut peers: Vec<PeerCommitments> = Vec::new();
-    for bytes in &all {
-        match bincode::serde::decode_from_slice::<PeerCommitments, _>(
+    // ---- Step 2: decode peer payloads ----
+    let mut peer_map = BTreeMap::new();
+
+    for bytes in &all_bytes {
+        match bincode::serde::decode_from_slice::<CommitmentsPayload, _>(
             bytes,
             bincode::config::standard(),
         ) {
             Ok((payload, _len)) => {
-                // convert CommitmentsPayload into PeerCommitments if needed
-                peers.push(payload);
+                // 1️⃣ Deserialize Identifier
+                let peer_id = frost_ed25519::Identifier::deserialize(&payload.node_id)
+                    .expect("invalid peer identifier");
+
+                // 2️⃣ Deserialize Round1 package
+                let pkg = dkg::round1::Package::deserialize(&payload.package)
+                    .expect("invalid peer package");
+
+                peer_map.insert(peer_id, pkg);
             }
-            Err(e) => eprintln!("⚠️ failed to decode peer commitment: {}", e),
+            Err(e) => eprintln!("⚠️ failed to decode peer payload: {}", e),
         }
     }
 
-    // println!("{:?} here we have peers commitment", peers);
-
-    let mut others = build_peer_participants(peers);
-    let params = Parameters { t: 2, n: 3 };
-
-    // ---- get my own participant + coefficients ----
-    let my_participant = data.participant.lock().unwrap();
-    let my_coeffs = data.coeffs.lock().unwrap();
-
-    if my_participant.is_none() || my_coeffs.is_none() {
-        return HttpResponse::BadRequest().body("run /dkg/init first");
+    if peer_map.is_empty() {
+        return HttpResponse::BadRequest().body("no valid peer packages received");
     }
 
-    let my_p = my_participant.as_ref().unwrap();
-    let my_c = my_coeffs.as_ref().unwrap();
+    // ---- Step 3: retrieve my Round1 secret ----
+    let my_secret_opt = data.r1_secret.lock().unwrap();
+    let Some(my_secret) = my_secret_opt.as_ref() else {
+        return HttpResponse::BadRequest().body("run /dkg/init first");
+    };
 
-    let dkg = DistributedKeyGeneration::<_>::new(&params, &my_p.index, &my_c, &mut others)
-        .expect("DKG round1 init");
+    // ---- Step 3.5: store the received Round1 peer packages ----
+    {
+        let mut received_guard = data.r1_received.lock().unwrap();
+        *received_guard = peer_map.clone();
+    }
 
-    let mut dkg_guard = data.dkg_state.lock().unwrap();
-    *dkg_guard = Some(dkg.clone());
+    // ---- Step 4: run Round 2 ----
+    let (r2_secret, r2_pkgs) = match dkg::part2(my_secret.clone(), &peer_map) {
+        Ok(result) => result,
+        Err(e) => {
+            return HttpResponse::InternalServerError().body(format!("part2 error: {:?}", e));
+        }
+    };
 
-    println!("✅ node {} DKG Round 1 prepared", data.node_id,);
+    // ---- Step 5: store Round 2 state ----
+    {
+        let mut r2s = data.r2_secret.lock().unwrap();
+        *r2s = Some(r2_secret);
+        let mut out = data.r2_outgoing.lock().unwrap();
+        *out = Some(r2_pkgs.clone());
+    }
 
-    HttpResponse::Ok().json(all)
+    println!("✅ node {:?} DKG Round 2 complete", data.node_id);
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "node_id": format!("{:?}", data.node_id),
+        "message": "Round 2 complete"
+    }))
 }
 
 #[post("/dkg/fetch_shares")]
 async fn fetch_peer_shares(data: web::Data<AppState>) -> impl Responder {
     let client = reqwest::Client::new();
-    let mut all_shares: Vec<serde_json::Value> = vec![];
+    let mut incoming_r2_pkgs = BTreeMap::new();
 
-    //  want the share for each peer
+    // ---- Step 1: ask each peer for their Round2 share addressed to me ----
     for peer in &data.peer_urls {
+        let node_id_b64 = general_purpose::STANDARD.encode(data.node_id.serialize());
         let rpc_body = serde_json::json!({
             "jsonrpc": "2.0",
             "method": "get_my_share",
-            "params": { "node_id": data.node_id },
-            "id": 1 //not used at all
+            "params": { "node_id": node_id_b64 },
+            "id": 1
         });
 
         let url = format!("{}/rpc", peer);
         match client.post(&url).json(&rpc_body).send().await {
-            Ok(resp) => {
-                if let Ok(json) = resp.json::<serde_json::Value>().await {
+            Ok(resp) => match resp.bytes().await {
+                Ok(bytes) => {
                     println!("📥 got share from {}", peer);
-                    all_shares.push(json);
+
+                    // ---- Step 2: decode the CommitmentsPayload ----
+                    let payload: CommitmentsPayload = match bincode::serde::decode_from_slice(
+                        &bytes,
+                        bincode::config::standard(),
+                    ) {
+                        Ok((p, _)) => p,
+                        Err(e) => {
+                            eprintln!("⚠️ failed to decode payload from {}: {}", peer, e);
+                            continue;
+                        }
+                    };
+
+                    // ---- Step 3: deserialize the package ----
+                    match dkg::round2::Package::deserialize(&payload.package) {
+                        Ok(pkg) => {
+                            let peer_id = Identifier::deserialize(&payload.node_id)
+                                .expect("peer id deserialize");
+                            incoming_r2_pkgs.insert(peer_id, pkg);
+                        }
+                        Err(e) => {
+                            eprintln!("⚠️ failed to deserialize package from {}: {}", peer, e)
+                        }
+                    }
                 }
-            }
+                Err(e) => eprintln!("⚠️ failed reading bytes from {}: {}", peer, e),
+            },
             Err(e) => eprintln!("❌ failed to reach {}: {}", peer, e),
         }
     }
 
+    // ---- Step 4: prepare Round1 peer map ----
+    let mut round1_peers = BTreeMap::new();
+    {
+        let r1_guard = data.r1_package.lock().unwrap();
+        let my_r1 = r1_guard.as_ref().expect("round1 not found");
 
-
-    let othershares = parse_peer_shares(&all_shares);
-
-    let p_guard = data.participant.lock().unwrap();
-
-    let participant = match p_guard.as_ref() {
-        Some(p) => p,
-        None => return HttpResponse::BadRequest().body("Participant not initialized"),
-    };
-    let mut dkg_state_guard = data.dkg_state.lock().unwrap();
-
-    // Take ownership of the RoundOne state
-    let round_one_state = match dkg_state_guard.take() {
-        Some(s) => s,
-        None => return HttpResponse::BadRequest().body("DKG state not initialized"),
-    };
-
-    // Compute RoundTwo (consumes RoundOne)
-    let my_round2 = match round_one_state.to_round_two(othershares) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("⚠️ Failed to compute Round 2: {:?}", e);
-            return HttpResponse::InternalServerError().body("Failed round 2");
+        let mut peers_guard = data.r1_received.lock().unwrap();
+        for (id, pkg) in peers_guard.iter() {
+            round1_peers.insert(*id, pkg.clone());
         }
+    }
+
+    // ---- Step 5: get my Round2 secret ----
+    let r2_secret_guard = data.r2_secret.lock().unwrap();
+    let Some(r2_secret) = r2_secret_guard.as_ref() else {
+        return HttpResponse::BadRequest().body("run /dkg/fetch first");
     };
 
-    // Optionally store the RoundTwo state back in the mutex if you need it later
-    // *dkg_state_guard = Some(my_round2.clone().into_round_one()); // optional
-
-    // Finish DKG
-    let (group_key, _secret_key) = match my_round2.finish(participant.public_key().unwrap()) {
+    // ---- Step 6: finalize DKG with part3 ----
+    let (key_pkg, pubkey_pkg) = match dkg::part3(&r2_secret, &round1_peers, &incoming_r2_pkgs) {
         Ok(res) => res,
         Err(e) => {
-            eprintln!("⚠️ Failed to Finish DKG : {:?}", e);
-            return HttpResponse::InternalServerError().body("❌ Failed to finish DKG");
+            eprintln!("❌ DKG part3 failed: {:?}", e);
+            return HttpResponse::InternalServerError().body("part3 failed");
         }
     };
 
-    // ---- Encode for JSON ----
-    let compressed = group_key.to_bytes();
-    let group_b64 = general_purpose::STANDARD.encode(&compressed);
+    {
+        let mut k = data.key_package.lock().unwrap();
+        *k = Some(key_pkg);
+        let mut p = data.pubkey_package.lock().unwrap();
+        *p = Some(pubkey_pkg.clone());
+    }
 
-    println!("✅ Group key (base64): {}", group_b64);
+    // ---- Step 7: print and return public key ----
+    let vk_bytes = pubkey_pkg.verifying_key().serialize().unwrap();
+    let group_hex = hex::encode(vk_bytes.clone());
+    println!("✅ DKG complete! Shared verifying key (hex): {}", group_hex);
+
+
+    //SOL ADDREESS BASE58 
+    let vk_arr: [u8; 32] = match vk_bytes.try_into() {
+        Ok(arr) => arr,
+        Err(_) => return HttpResponse::InternalServerError().body("wrong key length"),
+    };    
+    let dalek = match DalekPubkey::from_bytes(&vk_arr) {
+        Ok(d) => d,
+        Err(_) => return HttpResponse::InternalServerError().body("invalid dalek key"),
+    };
+    let sol_pk = Pubkey::new_from_array(dalek.to_bytes());
+    println!("Solana address: {}", sol_pk);
 
     HttpResponse::Ok().json(serde_json::json!({
-        "group_key": group_b64,
+        "verifying_key_hex": group_hex,
+        "solana_addresss": sol_pk,
+        "participants": incoming_r2_pkgs.len(),
+        "message": "Round3 complete"
     }))
 }
 
@@ -314,11 +381,21 @@ async fn main() -> std::io::Result<()> {
     println!("{:?}", peer_urls);
     // Shared state between routes
     let state = web::Data::new(AppState {
-        node_id,
-        participant: Arc::new(Mutex::new(None)),
-        coeffs: Arc::new(Mutex::new(None)),
-        dkg_state: Arc::new(Mutex::new(None)),
-        peer_urls, // 👈 added here
+        // DKG parameters
+        node_id: frost_ed25519::Identifier::try_from(node_id as u16).expect("invalid identifier"),
+        n: 3,
+        t: 2,
+
+        // DKG round states
+        peer_urls,
+        r1_secret: Arc::new(Mutex::new(None)),
+        r1_package: Arc::new(Mutex::new(None)),
+        r1_received: Arc::new(Mutex::new(BTreeMap::new())),
+        r2_secret: Arc::new(Mutex::new(None)),
+        r2_outgoing: Arc::new(Mutex::new(None)),
+        r2_incoming: Arc::new(Mutex::new(BTreeMap::new())),
+        key_package: Arc::new(Mutex::new(None)),
+        pubkey_package: Arc::new(Mutex::new(None)),
     });
 
     println!("🚀 Node {} running at http://{}", node_id, listen);
@@ -340,107 +417,24 @@ async fn main() -> std::io::Result<()> {
     .await
 }
 
-fn build_peer_participants(peers: Vec<PeerCommitments>) -> Vec<Participant> {
-    let mut others = Vec::new();
-
-    for peer in peers {
-        // ---- decode commitments ----
-        let decoded_points: Vec<RistrettoPoint> = peer
-            .commitments
-            .iter()
-            .map(|s| {
-                let compressed = CompressedRistretto::from_slice(s);
-                compressed.decompress().expect("valid point")
-            })
-            .collect();
-
-        // ---- decode proof fields (r, s) ----
-        let r = Scalar::from_bytes_mod_order(peer.proof_r);
-        let s = Scalar::from_bytes_mod_order(peer.proof_s);
-        let proof = NizkOfSecretKey::from_scalars(r, s);
-
-        // ---- construct full Participant ----
-        let p = Participant {
-            index: peer.node_id,
-            commitments: decoded_points.clone(),
-            proof_of_secret_key: proof,
-        };
-        
-        println!("[node {}] 🔍 Decoded commitments:", peer.node_id);
-        println!(" Decoded commitments: {:?}", decoded_points);
-        
-        for (i, point) in decoded_points.iter().enumerate() {
-            let compressed_bytes = point.compress().to_bytes();
-            println!(
-                "   commitment[{}] compressed bytes: {:?}",
-                i, compressed_bytes
-            );
-        }
-        
-
-        others.push(p);
-    }
-
-    others
-}
-
-// Helper to print points deterministically
-fn print_points(name: &str, points: &[RistrettoPoint]) {
-    println!("{}:", name);
-    for (i, pt) in points.iter().enumerate() {
-        let bytes = pt.compress().to_bytes();
-        println!("Point {}: {:?}", i, bytes);
-    }
-}
-
 //RPC METHODS ------------------------------------------------------------------------------------------------
-async fn get_my_commitments(data: &web::Data<AppState>) -> Result<HttpResponse, HttpResponse> {
-    let guard = data.participant.lock().unwrap();
-    let Some(p) = guard.as_ref() else {
-        return Err(HttpResponse::BadRequest().body("init first"));
+async fn get_my_commitments(data: web::Data<AppState>) -> Result<HttpResponse, HttpResponse> {
+    let guard = data.r1_package.lock().unwrap();
+    let Some(pkg) = guard.as_ref() else {
+        return Err(HttpResponse::BadRequest().body("run /dkg/init first"));
     };
 
-    // ✅ deterministic print before encoding
-    print_points("Before encoding", &p.commitments);
+    let encoded_pkg = pkg.serialize().map_err(|e| {
+        HttpResponse::InternalServerError().body(format!("serialize error: {:?}", e))
+    })?;
 
-    // Serialize commitments as bytes
-    let commitments: Vec<[u8; 32]> = p
-        .commitments
-        .iter()
-        .map(|pt| pt.compress().to_bytes())
-        .collect();
-    let (r_bytes, s_bytes) = p.proof_of_secret_key.to_bytess();
-
-    let payload = PeerCommitments {
-        node_id: data.node_id,
-        commitments: commitments.clone(),
-        proof_r: r_bytes,
-        proof_s: s_bytes,
+    let payload = CommitmentsPayload {
+        node_id: data.node_id.serialize(),
+        package: encoded_pkg,
     };
 
-    // Encode
     let encoded = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
         .map_err(|e| HttpResponse::InternalServerError().body(e.to_string()))?;
-
-    // Decode immediately
-    let decoded: PeerCommitments =
-        bincode::serde::decode_from_slice(&encoded, bincode::config::standard())
-            .map_err(|e| HttpResponse::InternalServerError().body(e.to_string()))?
-            .0;
-
-    // Rebuild points for round-trip check
-    let decoded_points: Vec<RistrettoPoint> = decoded
-        .commitments
-        .iter()
-        .map(|b| {
-            CompressedRistretto::from_slice(b)
-                .decompress()
-                .expect("invalid point")
-        })
-        .collect();
-
-    // ✅ deterministic print after decoding
-    print_points("After decoding", &decoded_points);
 
     Ok(HttpResponse::Ok()
         .content_type("application/octet-stream")
@@ -450,37 +444,47 @@ async fn get_my_commitments(data: &web::Data<AppState>) -> Result<HttpResponse, 
 async fn get_my_share(
     data: &web::Data<AppState>,
     params: &serde_json::Value,
-) -> Result<serde_json::Value, HttpResponse> {
-    let node_id = match params.get("node_id").and_then(|v| v.as_u64()) {
-        Some(id) => id as usize,
-        None => return Err(HttpResponse::BadRequest().body("missing or invalid node_id")),
+) -> Result<HttpResponse, HttpResponse> {
+    // ---- Step 1: extract target node id ----
+    let target_node_id_b64 = params
+        .get("node_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| HttpResponse::BadRequest().body("missing node_id"))?;
+
+    // decode the serialized identifier sent by requester
+    let target_id_bytes = general_purpose::STANDARD
+        .decode(target_node_id_b64)
+        .map_err(|_| HttpResponse::BadRequest().body("invalid base64 node_id"))?;
+
+    let target_id = frost_ed25519::Identifier::deserialize(&target_id_bytes)
+        .map_err(|_| HttpResponse::BadRequest().body("invalid serialized identifier"))?;
+
+    // ---- Step 2: get our outgoing round2 packages ----
+    let r2_out_guard = data.r2_outgoing.lock().unwrap();
+    let Some(r2_outgoing) = r2_out_guard.as_ref() else {
+        return Err(HttpResponse::BadRequest().body("run /dkg/fetch first"));
     };
 
-    let dkg_state = data.dkg_state.lock().unwrap();
-    let state = dkg_state.as_ref().ok_or_else(|| {
-        HttpResponse::BadRequest().body("DKG state not initialized you need dkg/inti and dkg/fetch")
+    // ---- Step 3: find the package addressed to that node ----
+    let Some(pkg) = r2_outgoing.get(&target_id) else {
+        return Err(HttpResponse::BadRequest().body("no package for requested node"));
+    };
+
+    // ---- Step 4: serialize and wrap into payload ----
+    let pkg_bytes = pkg.serialize().map_err(|e| {
+        HttpResponse::InternalServerError().body(format!("serialize error: {:?}", e))
     })?;
 
-    let shares = state.their_secret_shares().expect("Current node shares");
+    let payload = CommitmentsPayload {
+        node_id: data.node_id.serialize(), // this node’s ID (the sender)
+        package: pkg_bytes,
+    };
 
-    for share in shares.iter() {
-        println!(
-            "🟢 share index: {}, bytes: {:?}",
-            share.index,
-            share.to_bytes()
-        );
-    }
+    // ---- Step 5: encode and respond ----
+    let encoded = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
+        .map_err(|e| HttpResponse::InternalServerError().body(e.to_string()))?;
 
-    let other_share = shares
-        .iter()
-        .find(|s| s.index as usize == node_id)
-        .ok_or_else(|| HttpResponse::BadRequest().body("node_id not found"))?
-        .clone();
-
-    let share_bytes = STANDARD.encode(other_share.to_bytes());
-
-    Ok(serde_json::json!({
-        "node_id": data.node_id,
-        "your_share": share_bytes,
-    }))
+    Ok(HttpResponse::Ok()
+        .content_type("application/octet-stream")
+        .body(encoded))
 }
