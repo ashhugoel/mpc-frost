@@ -127,6 +127,18 @@ println!("Carol ID: {:?}", carol_id);
     println!("Solana address: {}", sol_pk);
 
 
+    
+    let message = b"ashu"; // message to sign 
+
+    
+    secret share for each node sign this message  ---> Signature from NODE 1 
+    secret share for each node sign this message  ---> Signature from NODE 2
+    secret share for each node sign this message  ---> Signature from NODE 3
+
+    Send to one node SAY NODE 1 ADD EM ALL S1 + S2 + S3 ==> SIGNATURE , R 
+
+    
+    
     println!("{:?}", alice_key);
 
 
