@@ -329,12 +329,11 @@ async fn fetch_peer_shares(data: web::Data<AppState>) -> impl Responder {
     let group_hex = hex::encode(vk_bytes.clone());
     println!("✅ DKG complete! Shared verifying key (hex): {}", group_hex);
 
-
-    //SOL ADDREESS BASE58 
+    //SOL ADDREESS BASE58
     let vk_arr: [u8; 32] = match vk_bytes.try_into() {
         Ok(arr) => arr,
         Err(_) => return HttpResponse::InternalServerError().body("wrong key length"),
-    };    
+    };
     let dalek = match DalekPubkey::from_bytes(&vk_arr) {
         Ok(d) => d,
         Err(_) => return HttpResponse::InternalServerError().body("invalid dalek key"),

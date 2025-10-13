@@ -1,11 +1,17 @@
+
 use base64::{Engine as _, engine::general_purpose};
 use bincode::{config, encode_to_vec};
 use ed25519_dalek::VerifyingKey as DalekPubkey;
 use frost::keys::dkg;
-use frost_ed25519::{self as frost, Ed25519Sha512, Identifier};
+use frost_ed25519::{self as frost, Ed25519Sha512, Identifier, keys::dkg::round1};
+use frost_ed25519::{
+    Signature, SigningPackage, aggregate, round1 as sign_round1, round2 as sign_round2,
+};
 use rand::rngs::OsRng;
+use solana_sdk::bs58;
 use solana_sdk::pubkey::Pubkey;
 use std::collections::BTreeMap;
+use ed25519_dalek::Signature as DalekSig;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let threshold = 2;
@@ -15,11 +21,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bob_id = Identifier::try_from(2u16)?;
     let carol_id = Identifier::try_from(3u16)?;
 
-    
-// Print them out
-println!("Alice ID: {:?}", alice_id);
-println!("Bob ID: {:?}", bob_id);
-println!("Carol ID: {:?}", carol_id);
+    // Print them out
+    println!("Alice ID: {:?}", alice_id);
+    println!("Bob ID: {:?}", bob_id);
+    println!("Carol ID: {:?}", carol_id);
 
     // ---- Round 1: Generate commitments for each participant ----
     let (alice_secret, alice_package) = dkg::part1(alice_id, 3, threshold, &mut rng)?;
@@ -50,17 +55,19 @@ println!("Carol ID: {:?}", carol_id);
     // Serialize
     let bytes = alice_r2_pkgs[&bob_id].serialize()?;
 
-
-    println!("✅ Round 2 done  {:?}" , bytes);
+    println!("✅ Round 2 done  {:?}", bytes);
 
     let pkg_back = dkg::round2::Package::deserialize(&bytes)?;
 
-    println!("✅ pk before encoding{:?}" ,  alice_r2_pkgs[&bob_id].signing_share.to_scalar());
+    println!(
+        "✅ pk before encoding{:?}",
+        alice_r2_pkgs[&bob_id].signing_share.to_scalar()
+    );
 
-
-    println!("✅ pk after deconding{:?}" , pkg_back.signing_share.to_scalar());
-
-
+    println!(
+        "✅ pk after deconding{:?}",
+        pkg_back.signing_share.to_scalar()
+    );
 
     // ---- Build correct Round 2 package maps ----
     // Alice receives from Bob + Carol (NO self)
@@ -79,7 +86,6 @@ println!("Carol ID: {:?}", carol_id);
     carol_r2_incoming.insert(bob_id, bob_r2_pkgs[&carol_id].clone());
 
     // ---- Each participant now calls part3 ----
-
 
     // ---- Each participant's Round1 peer view ----
     let mut alice_round1_peers = BTreeMap::new();
@@ -117,7 +123,6 @@ println!("Carol ID: {:?}", carol_id);
     let sol_pk = Pubkey::new_from_array(dalek.to_bytes());
     println!("Solana address: {}", sol_pk);
 
-
     let vk_bytes = bob_pub.verifying_key().serialize()?;
     let vk_arr: [u8; 32] = vk_bytes
         .try_into()
@@ -126,22 +131,73 @@ println!("Carol ID: {:?}", carol_id);
     let sol_pk = Pubkey::new_from_array(dalek.to_bytes());
     println!("Solana address: {}", sol_pk);
 
-
-    
+    //signature
     let message = b"ashu"; // message to sign 
 
+    // ---- Signing Round 1: each participant generates nonces + commitments ----
+    let (alice_nonce, alice_commitments) =
+        sign_round1::commit(&alice_key.signing_share(), &mut rng);
+    let (bob_nonce, bob_commitments) = sign_round1::commit(&bob_key.signing_share(), &mut rng);
+    let (carol_nonce, carol_commitments) =
+        sign_round1::commit(&carol_key.signing_share(), &mut rng);
+
+    // Everyone shares commitments with everyone (like we did for DKG messages)
+    let mut commitments = BTreeMap::new();
+    commitments.insert(alice_id, alice_commitments);
+    commitments.insert(bob_id, bob_commitments);
+    commitments.insert(carol_id, carol_commitments);
+
+    // This is the common signing context (message + all parties' commitments)
+    let signing_pkg = SigningPackage::new(commitments, message);
+
+    // ---- Signing Round 2: each participant produces a signature share ----
+    let alice_sig_share =
+        sign_round2::sign(&signing_pkg, &alice_nonce, &alice_key).expect("alice sign");
+    let bob_sig_share = sign_round2::sign(&signing_pkg, &bob_nonce, &bob_key).expect("bob sign");
+    let carol_sig_share =
+        sign_round2::sign(&signing_pkg, &carol_nonce, &carol_key).expect("carol sign");
+
+    println!("Signature share from NODE 1: {:?}", alice_sig_share);
+    println!("Signature share from NODE 2: {:?}", bob_sig_share);
+    println!("Signature share from NODE 3: {:?}", carol_sig_share);
+
+    // ---- Aggregate on any node (threshold ≥ 2; here we use all 3) ----
+    let mut shares = BTreeMap::new();
+    shares.insert(alice_id, alice_sig_share);
+    shares.insert(bob_id, bob_sig_share);
+    shares.insert(carol_id, carol_sig_share);
+
+    let group_sig = aggregate(&signing_pkg, &shares, &bob_pub).expect("aggregate shares");
+
+    // ---- Verify with the group public key (dalek) ----
+    let vk_bytes = alice_pub.verifying_key().serialize()?;
+    let vk_arr: [u8; 32] = vk_bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("wrong key length"))?;
+    let dalek_vk = DalekPubkey::from_bytes(&vk_arr)?;
+
+    // FROST signature -> bytes -> dalek signature for verification
+    let sig_bytes_vec = group_sig.serialize()?; // Vec<u8>, 64 bytes
+    println!("base58 encoded signature: {}", bs58::encode(&sig_bytes_vec).into_string());
+    let sig_bytes = sig_bytes_vec
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("wrong length"))?;
     
-    secret share for each node sign this message  ---> Signature from NODE 1 
-    secret share for each node sign this message  ---> Signature from NODE 2
-    secret share for each node sign this message  ---> Signature from NODE 3
+    let dalek_sig = DalekSig::from_bytes(&sig_bytes);
 
-    Send to one node SAY NODE 1 ADD EM ALL S1 + S2 + S3 ==> SIGNATURE , R 
+    match dalek_vk.verify_strict(message, &dalek_sig) {
+        Ok(_) => {
+            println!("✅ Signature verified successfully");
+        }
+        Err(e) => {
+            eprintln!("❌ Signature verification failed: {:?}", e);
+        }
+    }
+    println!("✅ Aggregated signature verified with group key");
 
-    
-    
-    println!("{:?}", alice_key);
-
-
+    // If you need the base58 Solana signer (same as before):
+    let sol_pk = Pubkey::new_from_array(dalek_vk.to_bytes());
+    println!("Solana address: {}", sol_pk);
 
     Ok(())
 }
