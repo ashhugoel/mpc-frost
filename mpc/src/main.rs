@@ -322,7 +322,7 @@ async fn fetch_peer_shares(data: web::Data<AppState>) -> impl Responder {
         *k = Some(key_pkg);
         let mut p = data.pubkey_package.lock().unwrap();
         *p = Some(pubkey_pkg.clone());
-    }
+    } 
 
     // ---- Step 7: print and return public key ----
     let vk_bytes = pubkey_pkg.verifying_key().serialize().unwrap();
