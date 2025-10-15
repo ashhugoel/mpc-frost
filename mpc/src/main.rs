@@ -1,7 +1,7 @@
 mod utils; // if in src/utils.rs
 use actix_web::{App, HttpResponse, HttpServer, Responder, post, web};
 use base64::{
-    Engine as _,
+    Engine as _, 
     engine::general_purpose::{self, STANDARD},
 };
 use ed25519_dalek::VerifyingKey as DalekPubkey;
