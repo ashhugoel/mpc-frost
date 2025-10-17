@@ -131,6 +131,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sol_pk = Pubkey::new_from_array(dalek.to_bytes());
     println!("Solana address: {}", sol_pk);
 
+
+    
     //signature
     let message = b"ashu"; // message to sign 
 

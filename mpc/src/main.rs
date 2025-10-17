@@ -1,34 +1,28 @@
 mod utils; // if in src/utils.rs
 use actix_web::{App, HttpResponse, HttpServer, Responder, post, web};
 use base64::{
-    Engine as _, 
-    engine::general_purpose::{self, STANDARD},
+    Engine as _,
+    engine::general_purpose::{self},
 };
 use ed25519_dalek::VerifyingKey as DalekPubkey;
 // use curve25519_dalek::ristretto::{RistrettoPoint, CompressedRistretto};
-use curve25519_dalek::{
-    ristretto::{CompressedRistretto, RistrettoPoint},
-    scalar::Scalar,
-};
-use frost_dalek::{
-    DistributedKeyGeneration, Parameters, Participant,
-    keygen::{Coefficients, DkgState, RoundOne},
-    nizk::NizkOfSecretKey,
-};
 use frost_ed25519::{
     Identifier,
     keys::{KeyPackage, PublicKeyPackage, dkg},
+    round1,
+};
+use frost_ed25519::{
+    Signature, SigningPackage, aggregate, round1 as sign_round1, round2 as sign_round2,
 };
 use rand_core::OsRng;
-use reqwest;
+use reqwest::{self, Client};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use solana_sdk::pubkey::Pubkey;
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
 };
-
-use crate::utils::parse_peer_shares;
 
 #[derive(Deserialize)]
 struct RpcRequest {
@@ -65,6 +59,9 @@ struct AppState {
     // ---- Final (after part3) ----
     pub key_package: Arc<Mutex<Option<KeyPackage>>>, // my private signing share package
     pub pubkey_package: Arc<Mutex<Option<PublicKeyPackage>>>, // shared group public key package
+
+    pub signing_nonce: Arc<Mutex<Option<sign_round1::SigningNonces>>>,
+    pub signing_commitment: Arc<Mutex<Option<sign_round1::SigningCommitments>>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -141,6 +138,11 @@ async fn rpc_handler(data: web::Data<AppState>, body: web::Json<RpcRequest>) -> 
             Err(err) => err,
         },
         "get_my_share" => match get_my_share(&data, &body.params).await {
+            Ok(resp) => resp, // <-- don't wrap it in .json()
+            Err(err) => err,
+        },
+
+        "get_nonce_commitment" => match my_nonce_commitment(&data).await {
             Ok(resp) => resp, // <-- don't wrap it in .json()
             Err(err) => err,
         },
@@ -322,7 +324,7 @@ async fn fetch_peer_shares(data: web::Data<AppState>) -> impl Responder {
         *k = Some(key_pkg);
         let mut p = data.pubkey_package.lock().unwrap();
         *p = Some(pubkey_pkg.clone());
-    } 
+    }
 
     // ---- Step 7: print and return public key ----
     let vk_bytes = pubkey_pkg.verifying_key().serialize().unwrap();
@@ -338,14 +340,115 @@ async fn fetch_peer_shares(data: web::Data<AppState>) -> impl Responder {
         Ok(d) => d,
         Err(_) => return HttpResponse::InternalServerError().body("invalid dalek key"),
     };
+    
     let sol_pk = Pubkey::new_from_array(dalek.to_bytes());
     println!("Solana address: {}", sol_pk);
 
+    let mut rng = OsRng;
+
+    // ---- Fetch the final signing share from KeyPackage ----
+    let key_guard = data.key_package.lock().unwrap();
+    let key_pkg = key_guard.as_ref().expect("❌ Run /dkg/fetch_shares first");
+
+    // ---- Round 1 of signing: generate nonce and commitments ----
+    let (nonce, commitments) = sign_round1::commit(key_pkg.signing_share(), &mut rng);
+    let pkg = commitments.serialize().expect("unable to serialize");
+
+    {
+        let mut nonce_guard = data.signing_nonce.lock().unwrap();
+        *nonce_guard = Some(nonce.clone());
+
+        let mut nonce_commitment_guard = data.signing_commitment.lock().unwrap();
+        *nonce_commitment_guard = Some(commitments.clone());
+    }
+
     HttpResponse::Ok().json(serde_json::json!({
         "verifying_key_hex": group_hex,
-        "solana_addresss": sol_pk,
         "participants": incoming_r2_pkgs.len(),
-        "message": "Round3 complete"
+        "message": "Round3 complete",
+        "solana_address": sol_pk.to_string(),
+        "pubkey_package_b58": bs58::encode(pubkey_pkg.serialize().unwrap()).into_string(),
+        "nonceCommitment" :bs58::encode(pkg).into_string()
+    }))
+}
+
+#[post("/dkg/signature")]
+async fn signature(data: web::Data<AppState>) -> impl Responder {
+    let client = Client::new();
+    let aggregator_url = "http://127.0.0.1:3000/get_signing_package";
+
+    // ---- Step 1: GET request
+    let resp = match client.get(aggregator_url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            println!("Failed to reach aggregator: {}", e);
+            return HttpResponse::InternalServerError().json(json!({
+                "error": format!("request failed: {}", e)
+            }));
+        }
+    };
+
+    // ---- Step 2: Parse JSON
+    let parsed: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            println!("⚠️ Invalid JSON from aggregator: {}", e);
+            return HttpResponse::InternalServerError().json(json!({
+                "error": "invalid JSON from aggregator"
+            }));
+        }
+    };
+
+    // ---- Step 3: Extract signing package b58 string
+    let Some(pkg_str) = parsed.get("signing_package_b58").and_then(|v| v.as_str()) else {
+        println!("⚠️ Missing signing_package_b58 in response");
+        return HttpResponse::BadRequest().json(json!({
+            "error": "missing signing_package_b58"
+        }));
+    };
+
+    // ---- Step 4: Decode + deserialize
+    let pkg_bytes = match bs58::decode(pkg_str).into_vec() {
+        Ok(b) => b,
+        Err(e) => {
+            return HttpResponse::InternalServerError().json(json!({
+                "error": format!("invalid base58 encoding: {}", e)
+            }));
+        }
+    };
+
+    let signing_pkg = match SigningPackage::deserialize(&pkg_bytes) {
+        Ok(p) => p,
+        Err(e) => {
+            return HttpResponse::InternalServerError().json(json!({
+                "error": format!("failed to deserialize SigningPackage: {:?}", e)
+            }));
+        }
+    };
+
+    let signing_guard = data.signing_nonce.lock().unwrap();
+    let Some(signing_nonces) = signing_guard.as_ref() else {
+        return HttpResponse::BadRequest().body("Third dkg round not cleared");
+    };
+    let shared_guard = data.key_package.lock().unwrap();
+    let Some(shared_key) = shared_guard.as_ref() else {
+        return HttpResponse::BadRequest().body("Third dkg round not cleared");
+    };
+
+    let node_sig_share = match sign_round2::sign(&signing_pkg, signing_nonces, shared_key) {
+        Ok(s) => s,
+        Err(e) => {
+            return HttpResponse::InternalServerError().json(json!({
+                "error": format!("signing failed: {:?}", e)
+            }));
+        }
+    };
+
+    HttpResponse::Ok().json(json!({
+        "message": "Signing package fetched and heres node sig",
+        "node_id":  bs58::encode(data.node_id.serialize()).into_string(),
+        "node_sig" : bs58::encode(node_sig_share
+            .serialize()).into_string()
     }))
 }
 
@@ -395,6 +498,8 @@ async fn main() -> std::io::Result<()> {
         r2_incoming: Arc::new(Mutex::new(BTreeMap::new())),
         key_package: Arc::new(Mutex::new(None)),
         pubkey_package: Arc::new(Mutex::new(None)),
+        signing_nonce: Arc::new(Mutex::new(None)),
+        signing_commitment: Arc::new(Mutex::new(None)),
     });
 
     println!("🚀 Node {} running at http://{}", node_id, listen);
@@ -408,6 +513,7 @@ async fn main() -> std::io::Result<()> {
                 .service(handle_dkg_init)
                 .service(rpc_handler) // 👈 add
                 .service(fetch_peer_commitments)
+                .service(signature)
                 .service(fetch_peer_shares)
         } // 👈 add
     })
@@ -486,4 +592,18 @@ async fn get_my_share(
     Ok(HttpResponse::Ok()
         .content_type("application/octet-stream")
         .body(encoded))
+}
+
+async fn my_nonce_commitment(data: &web::Data<AppState>) -> Result<HttpResponse, HttpResponse> {
+    let nonce_commitment_guard = data.signing_commitment.lock().unwrap();
+    let nonce_commitment = nonce_commitment_guard
+        .as_ref()
+        .expect("run /sign first to generate nonce");
+
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "node_id":  bs58::encode(data.node_id.serialize()).into_string(),
+        "nonce_commitment_b58": bs58::encode(
+            nonce_commitment.serialize().expect("serialize failed")
+        ).into_string()
+    })))
 }
