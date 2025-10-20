@@ -507,7 +507,7 @@ fn verify_group_signature(
     );
 
     let sig_bytes: [u8; 64] = sig_bytes_vec
-        .try_into()
+        .try_into()   
         .map_err(|_| anyhow::anyhow!("wrong signature length"))?;
 
     // ---- Step 3: Convert to dalek signature
