@@ -512,7 +512,7 @@ fn verify_group_signature(
 
     // ---- Step 3: Convert to dalek signature
     let dalek_sig = DalekSig::from_bytes(&sig_bytes);
-
+ 
     // ---- Step 4: Verify
     match dalek_vk.verify_strict(message, &dalek_sig) {
         Ok(_) => {
